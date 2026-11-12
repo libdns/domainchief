@@ -62,4 +62,6 @@ The integration test changes records in a real zone. It needs a token with the `
 DOMAINCHIEF_API_TOKEN=ctt_... DOMAINCHIEF_TEST_ZONE=example.com. go test -run TestIntegration -v ./...
 ```
 
+CI also runs the integration test on pushes to `master` when the `DOMAINCHIEF_TEST_ZONE` repository variable and `DOMAINCHIEF_API_TOKEN` repository secret are set.
+
 The [shared libdns test suite](libdnstest) runs from the `libdnstest` directory with the same environment variables.
