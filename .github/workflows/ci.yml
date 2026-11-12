@@ -26,6 +26,11 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      # The libdns test suite module needs a newer Go version than the provider itself.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: libdnstest/go.mod
+
       - name: Vet libdns test suite
         working-directory: libdnstest
         run: go vet ./...
