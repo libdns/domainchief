@@ -14,6 +14,8 @@ package domainchief
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -37,6 +39,14 @@ type Provider struct {
 
 	// HTTPClient overrides the HTTP client used for API requests.
 	HTTPClient *http.Client `json:"-"`
+
+	// WaitForPublication makes AppendRecords wait until every hosted DNS nameserver serves the ACME challenge
+	// values it publishes, so the certificate authority can validate them right away. This usually takes one to
+	// three minutes and at most 10 minutes. Other records are never waited for.
+	//
+	// Leave it disabled when your ACME client checks the nameservers itself. That check only reaches the
+	// nameservers near you, which can serve a value before the certificate authority's nameservers do.
+	WaitForPublication bool `json:"wait_for_publication,omitempty"`
 
 	zoneLocks sync.Map
 }
@@ -63,6 +73,8 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 //
 // ACME challenge TXT records on `_acme-challenge` names are published through the ACME challenge endpoint,
 // which keeps other values on the same name and returns the existing record when the value is already published.
+// With WaitForPublication enabled, AppendRecords then waits until every hosted DNS nameserver serves the
+// challenge values.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	inputs := make([]recordInput, len(records))
 
@@ -76,6 +88,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 	}
 
 	appended := make([]libdns.Record, 0, len(records))
+	var publishing []apiChallenge
 
 	for i, record := range records {
 		rr := record.RR()
@@ -84,6 +97,10 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 			challenge, err := p.presentChallenge(ctx, libdns.AbsoluteName(rr.Name, zone), rr.Data)
 			if err != nil {
 				return appended, err
+			}
+
+			if p.WaitForPublication && challenge.Status != challengeStatusPublished {
+				publishing = append(publishing, challenge)
 			}
 
 			appended = append(appended, libdns.TXT{
@@ -103,7 +120,59 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		appended = append(appended, toLibdns(created))
 	}
 
-	return appended, nil
+	return appended, p.waitUntilPublished(ctx, publishing)
+}
+
+// waitUntilPublished repeats publishing the ACME challenges until every hosted DNS nameserver serves them.
+//
+// Publishing is idempotent and returns the current status of the challenge. A challenge that failed or is
+// not published in time is deleted, so publishing it again later starts over.
+func (p *Provider) waitUntilPublished(ctx context.Context, challenges []apiChallenge) error {
+	deadline := time.Now().Add(publishTimeout)
+
+	for len(challenges) > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(publishPollInterval):
+		}
+
+		var remaining []apiChallenge
+
+		for _, challenge := range challenges {
+			current, err := p.presentChallenge(ctx, challenge.Name, challenge.Value)
+			if err != nil {
+				return err
+			}
+
+			switch current.Status {
+			case challengeStatusPublished:
+				continue
+			case challengeStatusFailed:
+				return p.abandonChallenge(ctx, challenge, "could not be added to the hosted DNS zone")
+			}
+
+			if !time.Now().Before(deadline) {
+				return p.abandonChallenge(ctx, challenge, fmt.Sprintf("is not served by every nameserver after %s", publishTimeout))
+			}
+
+			remaining = append(remaining, challenge)
+		}
+
+		challenges = remaining
+	}
+
+	return nil
+}
+
+func (p *Provider) abandonChallenge(ctx context.Context, challenge apiChallenge, reason string) error {
+	err := fmt.Errorf("domain chief: ACME challenge %s %s", challenge.Name, reason)
+
+	if cleanUpErr := p.cleanUpChallenge(ctx, challenge.Name, challenge.Value); cleanUpErr != nil {
+		return errors.Join(err, cleanUpErr)
+	}
+
+	return err
 }
 
 // SetRecords sets the records in the zone, either by updating existing records or creating new ones.

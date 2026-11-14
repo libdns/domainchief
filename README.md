@@ -15,11 +15,12 @@ provider := &domainchief.Provider{
 }
 ```
 
-| Field       | JSON        | Description                                                              |
-|-------------|-------------|--------------------------------------------------------------------------|
-| `APIToken`  | `api_token` | A Domain Chief API token (required).                                     |
-| `BaseURL`   | `base_url`  | Overrides the API base URL, defaults to `https://domain.chief.app/api/v1`. |
-| `HTTPClient`| -           | Overrides the HTTP client used for API requests.                          |
+| Field                | JSON                   | Description                                                                                                    |
+|----------------------|------------------------|----------------------------------------------------------------------------------------------------------------|
+| `APIToken`           | `api_token`            | A Domain Chief API token (required).                                                                           |
+| `BaseURL`            | `base_url`             | Overrides the API base URL, defaults to `https://domain.chief.app/api/v1`.                                     |
+| `HTTPClient`         | -                      | Overrides the HTTP client used for API requests.                                                               |
+| `WaitForPublication` | `wait_for_publication` | Makes `AppendRecords` wait until every nameserver serves new ACME challenge values, see [behavior](#behavior). |
 
 The zone is the domain name in Domain Chief, for example `example.com.`. The domain must use hosted DNS.
 
@@ -41,12 +42,13 @@ The `domainchief:acme:write` scope only allows publishing and deleting TXT recor
 ## Behavior
 
 - `AppendRecords` and `DeleteRecords` send TXT records on `_acme-challenge` names holding an ACME challenge value (base64url characters) to the dedicated ACME challenge endpoints. Those keep other values on the same name, so concurrent challenges for the same name (for example `example.com` and `*.example.com`) work. Challenge values that are not deleted are removed automatically after 24 hours. Because the challenge endpoint does not report whether a value existed, `DeleteRecords` always returns challenge records as deleted.
+- With `WaitForPublication` enabled, `AppendRecords` returns once every hosted DNS nameserver serves the ACME challenge values, so the certificate authority can validate them right away. This usually takes one to three minutes, longer while other changes to the same domain are being published. A challenge that is not published within 10 minutes, or that fails to publish, is deleted and returned as an error. Pass a context with a deadline to wait less. Enable it when you solve ACME challenges: checking the nameservers yourself only reaches the ones near you, which can serve a value before the certificate authority's nameservers do.
 - All other records use the DNS record endpoints.
 - Supported record types are `A`, `AAAA`, `ALIAS`, `CAA`, `CNAME`, `MX`, `NS`, `SRV`, `TLSA` and `TXT`. `ALIAS` and `TLSA` records are returned as `libdns.RR`.
 - TTLs are rounded to the closest TTL Domain Chief supports (`60`, `300`, `900`, `1800`, `3600`, `21600`, `43200`, `86400`, `172800`, `259200`, `604800`, `1209600` or `2592000` seconds). A TTL of `0` uses `3600` seconds.
 - `SetRecords` is not atomic. For every name and type in the input it keeps records with the same value, updates other existing records to hold the remaining values and deletes leftover records. When an error is returned some of the changes may have been applied.
 - Requests are retried for a few seconds when another hosted DNS write for the same domain is still running or when the API is rate limiting requests.
-- DNS changes are published to the hosted DNS nameservers asynchronously. They are usually visible within a minute.
+- Other DNS changes, and ACME challenges without `WaitForPublication`, are published to the hosted DNS nameservers asynchronously. They usually reach every nameserver within one to three minutes.
 
 ## Testing
 
@@ -59,7 +61,7 @@ go test ./...
 The integration test changes records in a real zone. It needs a token with the `domainchief:acme:write` and `domainchief:dns:write` scopes:
 
 ```bash
-DOMAINCHIEF_API_TOKEN=ctt_... DOMAINCHIEF_TEST_ZONE=example.com. go test -run TestIntegration -v ./...
+DOMAINCHIEF_API_TOKEN=ctt_... DOMAINCHIEF_TEST_ZONE=example.com. go test -timeout 15m -run TestIntegration -v ./...
 ```
 
 CI also runs the integration test on pushes to `master` when the `DOMAINCHIEF_TEST_ZONE` repository variable and `DOMAINCHIEF_API_TOKEN` repository secret are set.

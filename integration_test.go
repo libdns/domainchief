@@ -15,15 +15,17 @@ import (
 //
 // Run it with a token that has the `domainchief:acme:write` and `domainchief:dns:write` scopes:
 //
-//	DOMAINCHIEF_API_TOKEN=ctt_... DOMAINCHIEF_TEST_ZONE=example.com. go test -run TestIntegration -v ./...
+//	DOMAINCHIEF_API_TOKEN=ctt_... DOMAINCHIEF_TEST_ZONE=example.com. go test -timeout 15m -run TestIntegration -v ./...
 func TestIntegration(t *testing.T) {
 	token, zone := os.Getenv("DOMAINCHIEF_API_TOKEN"), os.Getenv("DOMAINCHIEF_TEST_ZONE")
 	if token == "" || zone == "" {
 		t.Skip("set DOMAINCHIEF_API_TOKEN and DOMAINCHIEF_TEST_ZONE to run the integration test")
 	}
 
-	provider := &Provider{APIToken: token, BaseURL: os.Getenv("DOMAINCHIEF_API_BASE_URL")}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	provider := &Provider{APIToken: token, BaseURL: os.Getenv("DOMAINCHIEF_API_BASE_URL"), WaitForPublication: true}
+
+	// Publishing an ACME challenge waits until every nameserver serves it, which can take a few minutes.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
 	suffix := time.Now().Format("20060102150405")

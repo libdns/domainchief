@@ -31,10 +31,15 @@ type fakeAPI struct {
 	domains  []apiDomain
 	perPage  int
 	failures map[string][]int
+
+	// challengeStatuses holds the statuses returned by consecutive publish requests for a challenge value,
+	// a value is published once its statuses run out.
+	challengeStatuses map[string][]string
+	published         []string
 }
 
 func newFakeAPI(t *testing.T, records ...apiRecord) (*fakeAPI, *Provider) {
-	api := &fakeAPI{t: t, records: records, nextID: len(records) + 1, perPage: perPage, failures: map[string][]int{}}
+	api := &fakeAPI{t: t, records: records, nextID: len(records) + 1, perPage: perPage, failures: map[string][]int{}, challengeStatuses: map[string][]string{}}
 
 	server := httptest.NewServer(api)
 	t.Cleanup(server.Close)
@@ -123,6 +128,7 @@ func (api *fakeAPI) serveChallenge(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		name, value = body["name"], body["value"]
+		api.published = append(api.published, value)
 	} else {
 		name, value = r.URL.Query().Get("name"), r.URL.Query().Get("value")
 	}
@@ -138,7 +144,7 @@ func (api *fakeAPI) serveChallenge(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": apiChallenge{ID: record.ID, Name: name, Value: value, TTL: record.TTL}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": apiChallenge{ID: record.ID, Name: name, Value: value, TTL: record.TTL, Status: api.challengeStatus(value)}})
 
 			return
 		}
@@ -155,7 +161,29 @@ func (api *fakeAPI) serveChallenge(w http.ResponseWriter, r *http.Request) {
 	api.records = append(api.records, record)
 
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]any{"data": apiChallenge{ID: record.ID, Name: name, Value: value, TTL: 60}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"data": apiChallenge{ID: record.ID, Name: name, Value: value, TTL: 60, Status: api.challengeStatus(value)}})
+}
+
+func (api *fakeAPI) challengeStatus(value string) string {
+	statuses := api.challengeStatuses[value]
+
+	if len(statuses) == 0 {
+		return challengeStatusPublished
+	}
+
+	api.challengeStatuses[value] = statuses[1:]
+
+	return statuses[0]
+}
+
+// fastPublishPolling makes waiting for ACME challenges to be published quick enough for tests.
+func fastPublishPolling(t *testing.T, timeout time.Duration) {
+	interval, previousTimeout := publishPollInterval, publishTimeout
+	publishPollInterval, publishTimeout = time.Millisecond, timeout
+
+	t.Cleanup(func() {
+		publishPollInterval, publishTimeout = interval, previousTimeout
+	})
 }
 
 func (api *fakeAPI) store(id string, input recordInput) apiRecord {
@@ -228,6 +256,115 @@ func TestAppendRecordsPublishesACMEChallengesThroughChallengeEndpoint(t *testing
 
 	if len(records) != 1 || records[0].Name != "_acme-challenge.www" {
 		t.Errorf("unexpected records %v", records)
+	}
+}
+
+func TestAppendRecordsWaitsUntilEveryACMEChallengeIsPublished(t *testing.T) {
+	fastPublishPolling(t, time.Minute)
+
+	api, provider := newFakeAPI(t)
+	provider.WaitForPublication = true
+	api.challengeStatuses["first"] = []string{"pending", "publishing"}
+	api.challengeStatuses["second"] = []string{"publishing", "some_future_status", "publishing"}
+
+	appended, err := provider.AppendRecords(context.Background(), "example.com.", []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", Text: "first"},
+		libdns.TXT{Name: "_acme-challenge", Text: "second"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(appended) != 2 {
+		t.Errorf("unexpected appended records %#v", appended)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+
+	// Both values are published before polling starts, and polling stops for each value once it is published.
+	expected := []string{"first", "second", "first", "second", "first", "second", "second"}
+	if !reflect.DeepEqual(api.published, expected) {
+		t.Errorf("unexpected publish requests\n got: %v\nwant: %v", api.published, expected)
+	}
+}
+
+func TestAppendRecordsDoesNotWaitForACMEChallengesByDefault(t *testing.T) {
+	fastPublishPolling(t, time.Minute)
+
+	api, provider := newFakeAPI(t)
+	api.challengeStatuses["token"] = []string{"pending"}
+
+	if _, err := provider.AppendRecords(context.Background(), "example.com.", []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", Text: "token"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, requests := api.snapshot(); len(requests) != 1 {
+		t.Errorf("expected a single publish request, got %v", requests)
+	}
+}
+
+func TestAppendRecordsDeletesACMEChallengesThatFailToPublish(t *testing.T) {
+	fastPublishPolling(t, time.Minute)
+
+	api, provider := newFakeAPI(t)
+	provider.WaitForPublication = true
+	api.challengeStatuses["token"] = []string{"pending", "failed"}
+
+	_, err := provider.AppendRecords(context.Background(), "example.com.", []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", Text: "token"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "could not be added to the hosted DNS zone") {
+		t.Fatalf("expected a failed challenge error, got %v", err)
+	}
+
+	records, requests := api.snapshot()
+	if len(records) != 0 || requests[len(requests)-1] != "DELETE /acme/challenges" {
+		t.Errorf("expected the challenge to be deleted, got records %v after requests %v", records, requests)
+	}
+}
+
+func TestAppendRecordsDeletesACMEChallengesThatAreNotPublishedInTime(t *testing.T) {
+	fastPublishPolling(t, 0)
+
+	api, provider := newFakeAPI(t)
+	provider.WaitForPublication = true
+	api.challengeStatuses["token"] = []string{"publishing", "publishing"}
+
+	_, err := provider.AppendRecords(context.Background(), "example.com.", []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", Text: "token"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "is not served by every nameserver") {
+		t.Fatalf("expected a timeout error, got %v", err)
+	}
+
+	if records, _ := api.snapshot(); len(records) != 0 {
+		t.Errorf("expected the challenge to be deleted, got %v", records)
+	}
+}
+
+func TestAppendRecordsStopsWaitingWhenTheContextIsCanceled(t *testing.T) {
+	fastPublishPolling(t, time.Minute)
+	publishPollInterval = time.Hour
+
+	api, provider := newFakeAPI(t)
+	provider.WaitForPublication = true
+	api.challengeStatuses["token"] = []string{"publishing"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	appended, err := provider.AppendRecords(ctx, "example.com.", []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", Text: "token"},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the context error, got %v", err)
+	}
+
+	if len(appended) != 1 {
+		t.Errorf("expected the published challenge to be returned, got %#v", appended)
 	}
 }
 

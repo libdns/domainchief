@@ -27,6 +27,17 @@ const (
 
 	// maxPages limits how many pages a listing fetches, so an unexpected API response can never make it loop forever.
 	maxPages = 1000
+
+	challengeStatusPublished = "published"
+	challengeStatusFailed    = "failed"
+)
+
+var (
+	// publishPollInterval is how often the status of an ACME challenge is checked until it is published.
+	publishPollInterval = 5 * time.Second
+
+	// publishTimeout limits how long AppendRecords waits until an ACME challenge is published.
+	publishTimeout = 10 * time.Minute
 )
 
 // APIError is returned when the Domain Chief API responds with an unexpected status code.
@@ -102,6 +113,10 @@ type apiChallenge struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 	TTL   int    `json:"ttl"`
+
+	// Status is `published` once every hosted DNS nameserver serves the value and `failed` when it could not be
+	// added to the hosted DNS zone. Other values, including ones added later, mean the value is still publishing.
+	Status string `json:"status"`
 }
 
 type apiDomain struct {
